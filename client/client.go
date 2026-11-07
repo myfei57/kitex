@@ -262,6 +262,11 @@ func (kc *kClient) initLBCache() error {
 		cacheOpts = *kc.opt.BalancerCacheOpt
 	}
 	kc.lbf = lbcache.NewBalancerFactory(resolver, balancer, cacheOpts)
+	kc.opt.CloseCallbacks = append(kc.opt.CloseCallbacks, func() error {
+		// cancel managed discovery refreshes and release balancer resources;
+		// shared cacheable factories are reference counted
+		return kc.lbf.Close()
+	})
 	rbIdx := kc.lbf.RegisterRebalanceHook(onChange)
 	kc.opt.CloseCallbacks = append(kc.opt.CloseCallbacks, func() error {
 		kc.lbf.DeregisterRebalanceHook(rbIdx)
