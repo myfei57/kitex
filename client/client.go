@@ -48,6 +48,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/remote/bound"
 	"github.com/cloudwego/kitex/pkg/remote/remotecli"
 	"github.com/cloudwego/kitex/pkg/retry"
+	"github.com/cloudwego/kitex/pkg/retry/attempttrace"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
 	"github.com/cloudwego/kitex/pkg/rpctimeout"
@@ -401,16 +402,34 @@ func (kc *kClient) Call(ctx context.Context, method string, request, response in
 	// Add necessary keys to context for isolation between kitex client method calls
 	ctx = retry.PrepareRetryContext(ctx)
 
+	// Enable the optional RPC attempt trace. A collector attached to the
+	// context by the caller takes precedence; otherwise the client-level
+	// option creates a fresh per-call collector so traces can never be
+	// shared across requests.
+	if traceCfg := kc.opt.UnaryOptions.AttemptTraceConfig; traceCfg != nil &&
+		attempttrace.CollectorFromContext(ctx) == nil {
+		ctx = attempttrace.NewCtxWithCollector(ctx, attempttrace.NewCollectorWithConfig(*traceCfg))
+	}
+
 	if mi := ri.Invocation().MethodInfo(); mi == nil {
 		err = kerrors.ErrNonExistentMethod(kc.svcInfo.ServiceName, method)
 	} else if mi.StreamingMode() != serviceinfo.StreamingNone && mi.StreamingMode() != serviceinfo.StreamingUnary {
 		err = kerrors.ErrNotUnaryMethod(kc.svcInfo.ServiceName, method)
 	} else if kc.opt.UnaryOptions.RetryContainer == nil {
-		// call without retry policy
+		// call without retry policy: at most one physical attempt
+		traceCol := attempttrace.CollectorFromContext(ctx)
+		traceCol.MarkLogicalStart("None", method)
+		h := traceCol.ReserveAttempt(attempttrace.TriggerInitial, 0, "initial attempt")
+		h.MarkStarted()
 		err = kc.eps(ctx, request, response)
+		h.Finish(attempttrace.KitexFinishInfo(ri, err, false, err == nil))
 		if err == nil {
 			recycleRI = true
+			traceCol.MarkWinner(h.ID())
 		}
+		// the logical return is recorded explicitly here because the retry
+		// container's WithRetryIfNeeded path is not involved
+		traceCol.MarkLogicalReturn(err)
 	} else {
 		var lastRI rpcinfo.RPCInfo
 		lastRI, recycleRI, err = kc.opt.UnaryOptions.RetryContainer.WithRetryIfNeeded(ctx, callOptRetry, kc.rpcCallWithRetry(ri, method), ri, request, response)

@@ -28,6 +28,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/circuitbreak"
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/klog"
+	"github.com/cloudwego/kitex/pkg/retry/attempttrace"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 )
 
@@ -84,14 +85,23 @@ func (r *failureRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rp
 	retryTimes := r.policy.StopPolicy.MaxRetryTimes
 	r.RUnlock()
 
+	col := traceCollector(ctx)
 	var callTimes int32
 	var callCosts strings.Builder
 	var cRI rpcinfo.RPCInfo
+	var curHandle, lastHandle *attempttrace.Handle
 	cbKey, _ := r.cbContainer.cbCtl.GetKey(ctx, req)
 	defer func() {
 		if panicInfo := recover(); panicInfo != nil {
+			// Finish is exactly-once, so this is a no-op when the attempt already terminated.
+			curHandle.Finish(attempttrace.FinishInfo{
+				Status: attempttrace.StatusPanicked,
+				ErrMsg: fmt.Sprintf("panic in failure retry: %v", panicInfo),
+			})
 			err = panicToErr(ctx, panicInfo, firstRI)
 		}
+		// the last attempt's outcome (success or final error) is the adopted one
+		col.MarkWinner(lastHandle.ID())
 	}()
 	startTime := time.Now()
 	var curResp interface{}
@@ -99,9 +109,11 @@ func (r *failureRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rp
 	for i := 0; i <= retryTimes; i++ {
 		var callStart time.Time
 		if i == 0 {
+			curHandle = col.ReserveAttempt(attempttrace.TriggerInitial, 0, "initial attempt")
 			callStart = startTime
 		} else if i > 0 {
 			if ret, e := isExceedMaxDuration(ctx, startTime, maxDuration, callTimes); ret {
+				col.AppendEvent(attempttrace.EventRetrySuppressed, 0, e.Error())
 				err = e
 				break
 			}
@@ -109,9 +121,11 @@ func (r *failureRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rp
 				if msg != "" {
 					appendMsg := fmt.Sprintf("retried %d, %s", i-1, msg)
 					appendErrMsg(err, appendMsg)
+					col.AppendEvent(attempttrace.EventRetrySuppressed, lastHandle.ID(), msg)
 				}
 				break
 			}
+			curHandle = col.ReserveAttempt(attempttrace.TriggerFailureRetry, lastHandle.ID(), traceFailureReason(err))
 			callStart = time.Now()
 			callCosts.WriteByte(',')
 		}
@@ -121,7 +135,10 @@ func (r *failureRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rp
 			recordRetryStat(cbKey, r.cbContainer.cbPanel, callTimes)
 		}
 		curResp = newRespFunc()
+		curHandle.MarkStarted()
 		cRI, err = rpcCall(ctx, r, req, curResp)
+		curHandle.Finish(traceFinishInfo(cRI, err, false, false))
+		lastHandle = curHandle
 		callCosts.WriteString(strconv.FormatInt(time.Since(callStart).Microseconds(), 10))
 
 		if !r.cbContainer.enablePercentageLimit && r.cbContainer.cbStat {

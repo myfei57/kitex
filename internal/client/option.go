@@ -46,6 +46,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc"
 	"github.com/cloudwego/kitex/pkg/remote/trans/ttstream"
 	"github.com/cloudwego/kitex/pkg/retry"
+	"github.com/cloudwego/kitex/pkg/retry/attempttrace"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
@@ -76,6 +77,11 @@ type UnaryOptions struct {
 	RetryMethodPolicies map[string]retry.Policy
 	RetryContainer      *retry.Container
 	RetryWithResult     *retry.ShouldResultRetry
+
+	// AttemptTraceConfig, when non-nil, enables the optional per-call RPC
+	// attempt trace. A fresh Collector is created for every Call and carried
+	// by the context, so traces never leak across requests.
+	AttemptTraceConfig *attempttrace.Config
 
 	// fallback policy
 	Fallback *fallback.Policy

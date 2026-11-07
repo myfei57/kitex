@@ -30,6 +30,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/circuitbreak"
 	"github.com/cloudwego/kitex/pkg/gofunc"
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/retry/attempttrace"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/utils"
 )
@@ -55,9 +56,10 @@ type backupRetryer struct {
 }
 
 type resultWrapper struct {
-	ri   rpcinfo.RPCInfo
-	resp interface{}
-	err  error
+	ri     rpcinfo.RPCInfo
+	resp   interface{}
+	err    error
+	handle *attempttrace.Handle
 }
 
 // ShouldRetry implements the Retryer interface.
@@ -93,6 +95,7 @@ func (r *backupRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpc
 	retryDelay := r.retryDelay
 	r.RUnlock()
 
+	col := traceCollector(ctx)
 	var callTimes int32 = 0
 	var callCosts utils.StringBuilder
 	callCosts.RawStringBuilder().Grow(32)
@@ -109,14 +112,32 @@ func (r *backupRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpc
 		timer.Stop()
 	}()
 	newRespFunc := getNewRespFunc(firstRI.Invocation().MethodInfo())
+	// inflightID identifies the attempt that the backup timer is currently
+	// waiting on, so backup attempts carry a causal parent instead of relying
+	// on slice append / completion ordering.
+	var inflightID attempttrace.AttemptID
 	// include first call, max loop is retryTimes + 1
 	doCall := true
 	for i := 0; ; {
 		if doCall {
 			doCall = false
 			i++
+			// Reserve at the real launch decision point: the stable start
+			// sequence reflects launch order even if goroutines or completions
+			// are reordered by the runtime.
+			var h *attempttrace.Handle
+			if i == 1 {
+				h = col.ReserveAttempt(attempttrace.TriggerInitial, 0, "initial attempt")
+			} else {
+				h = col.ReserveAttempt(attempttrace.TriggerBackupRequest, inflightID,
+					fmt.Sprintf("backup timer elapsed after %s", retryDelay))
+			}
+			inflightID = h.ID()
 			gofunc.GoFunc(ctx, func() {
 				if atomic.LoadInt32(&abort) == 1 {
+					// never ran a physical RPC: terminalize explicitly so Wait
+					// cannot leak an unfinished attempt
+					h.AbortBeforeStart()
 					return
 				}
 				var (
@@ -127,9 +148,15 @@ func (r *backupRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpc
 				defer func() {
 					if panicInfo := recover(); panicInfo != nil {
 						e = panicToErr(ctx, panicInfo, firstRI)
+						h.Finish(attempttrace.FinishInfo{
+							Status:    attempttrace.StatusPanicked,
+							ErrMsg:    fmt.Sprintf("panic in backup retry: %v", panicInfo),
+							Abandoned: atomic.LoadInt32(&abort) == 1,
+						})
 					}
-					done <- resultWrapper{ri: cRI, resp: curResp, err: e}
+					done <- resultWrapper{ri: cRI, resp: curResp, err: e, handle: h}
 				}()
+				h.MarkStarted()
 				ct := atomic.AddInt32(&callTimes, 1)
 				callStart := time.Now()
 				if r.cbContainer.enablePercentageLimit {
@@ -137,6 +164,7 @@ func (r *backupRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpc
 					recordRetryStat(cbKey, r.cbContainer.cbPanel, ct)
 				}
 				cRI, e = rpcCall(ctx, r, req, curResp)
+				h.Finish(traceFinishInfo(cRI, e, atomic.LoadInt32(&abort) == 1, false))
 				recordCost(ct, callStart, &recordCostDoing, &callCosts, &abort, e)
 				if !r.cbContainer.enablePercentageLimit && r.cbContainer.cbStat {
 					circuitbreak.RecordStat(ctx, req, nil, e, cbKey, r.cbContainer.cbCtl, r.cbContainer.cbPanel)
@@ -148,10 +176,15 @@ func (r *backupRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpc
 			if _, ok := r.ShouldRetry(ctx, nil, i, req, cbKey); ok && i <= retryTimes {
 				doCall = true
 				timer.Reset(retryDelay)
+			} else {
+				col.AppendEvent(attempttrace.EventRetrySuppressed, inflightID, "backup retry not allowed or policy exhausted")
 			}
 		case res := <-done:
 			shallowCopyResults(res.resp, resp)
 			atomic.StoreInt32(&abort, 1)
+			// winner adopted; other in-flight attempts stay non-terminal and
+			// are flagged abandoned until they really finish
+			col.MarkWinner(res.handle.ID())
 			recordRetryInfo(res.ri, atomic.LoadInt32(&callTimes), callCosts.String())
 			return res.ri, false, res.err
 		}

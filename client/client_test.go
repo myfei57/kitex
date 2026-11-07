@@ -49,6 +49,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/retry"
+	"github.com/cloudwego/kitex/pkg/retry/attempttrace"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
 	"github.com/cloudwego/kitex/pkg/rpctimeout"
@@ -203,6 +204,57 @@ func TestWithRetryOption(t *testing.T) {
 	cli := newMockClient(t, ctrl, WithRetryContainer(mockRetryContainer))
 
 	test.Assert(t, cli.(*kcFinalizerClient).opt.UnaryOptions.RetryContainer == mockRetryContainer)
+}
+
+func TestWithAttemptTraceOption(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	got := make(chan *attempttrace.Snapshot, 1)
+	cli := newMockClient(t, ctrl, WithAttemptTrace(
+		attempttrace.WithMaxEvents(64),
+		attempttrace.WithObserver(func(s *attempttrace.Snapshot) {
+			got <- s
+		}),
+	))
+	test.Assert(t, cli.(*kcFinalizerClient).opt.UnaryOptions.AttemptTraceConfig != nil)
+	test.Assert(t, cli.(*kcFinalizerClient).opt.UnaryOptions.AttemptTraceConfig.MaxEvents == 64)
+
+	err := cli.Call(context.Background(), mocks.MockMethod, new(MockTStruct), new(MockTStruct))
+	test.Assert(t, err == nil, err)
+
+	// observer delivery is asynchronous and isolated from the call path
+	select {
+	case snap := <-got:
+		test.Assert(t, snap.LogicalReturned)
+		test.Assert(t, len(snap.Attempts) == 1)
+		test.Assert(t, snap.Attempts[0].Status == attempttrace.StatusSucceeded)
+		test.Assert(t, snap.Winner == snap.Attempts[0].ID)
+		test.Assert(t, snap.Attempts[0].ResultAdopted)
+	case <-time.After(5 * time.Second):
+		t.Fatal("attempt trace observer not invoked")
+	}
+}
+
+func TestAttemptTraceContextCollectorPrecedence(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// client-level option enabled, but the caller supplies its own collector
+	cli := newMockClient(t, ctrl, WithAttemptTrace(attempttrace.WithObserver(func(s *attempttrace.Snapshot) {
+		t.Error("the context collector must take precedence over the option observer")
+	})))
+
+	col := attempttrace.NewCollector()
+	ctx := attempttrace.NewCtxWithCollector(context.Background(), col)
+	err := cli.Call(ctx, mocks.MockMethod, new(MockTStruct), new(MockTStruct))
+	test.Assert(t, err == nil, err)
+	test.Assert(t, col.Wait(context.Background()) == nil)
+
+	snap := col.Snapshot()
+	test.Assert(t, snap.LogicalReturned)
+	test.Assert(t, len(snap.Attempts) == 1)
+	test.Assert(t, snap.Attempts[0].Trigger == attempttrace.TriggerInitial)
 }
 
 func BenchmarkCall(b *testing.B) {

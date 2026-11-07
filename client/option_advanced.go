@@ -36,6 +36,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/remote/trans/netpoll"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc"
 	"github.com/cloudwego/kitex/pkg/retry"
+	"github.com/cloudwego/kitex/pkg/retry/attempttrace"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/utils"
 )
@@ -163,6 +164,30 @@ func WithRetryContainer(rc *retry.Container) Option {
 			panic("invalid retry container: nil")
 		}
 		o.UnaryOptions.RetryContainer = rc
+	}}
+}
+
+// WithAttemptTrace enables the optional per-call RPC attempt trace for
+// unary calls. A dedicated attempttrace.Collector is created for every Call
+// and carried by the call context, so concurrent requests never share
+// traces. The trace only records stable attempt IDs, trigger reasons,
+// selected instance coordinates, timestamps and completion classes; it
+// never records request/response business values, and enabling it never
+// changes retry decisions or RPC results.
+//
+// For direct control (Wait/Snapshot/Subscribe), attach a Collector to the
+// context yourself via attempttrace.NewCtxWithCollector; a Collector found
+// in the context always takes precedence over this option.
+func WithAttemptTrace(opts ...attempttrace.Option) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		o.Once.OnceOrPanic()
+		di.Push(fmt.Sprintf("WithAttemptTrace(%d)", len(opts)))
+
+		cfg := &attempttrace.Config{}
+		for _, opt := range opts {
+			opt(cfg)
+		}
+		o.UnaryOptions.AttemptTraceConfig = cfg
 	}}
 }
 

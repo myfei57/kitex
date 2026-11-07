@@ -27,6 +27,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/circuitbreak"
 	"github.com/cloudwego/kitex/pkg/gofunc"
 	"github.com/cloudwego/kitex/pkg/klog"
+	"github.com/cloudwego/kitex/pkg/retry/attempttrace"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/utils"
 )
@@ -87,6 +88,7 @@ func (r *mixedRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpci
 	retryDelay := r.retryDelay
 	r.RUnlock()
 
+	col := traceCollector(ctx)
 	var callTimes int32
 	var callCosts utils.StringBuilder
 	callCosts.RawStringBuilder().Grow(32)
@@ -107,6 +109,13 @@ func (r *mixedRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpci
 	}()
 	startTime := time.Now()
 	newRespFunc := getNewRespFunc(firstRI.Invocation().MethodInfo())
+	// inflightID is the attempt the backup timer is currently waiting on.
+	// nextTrigger/nextParent carry the real causal information of the next
+	// launch so parentage never depends on completion ordering.
+	var inflightID attempttrace.AttemptID
+	var nextTrigger attempttrace.Trigger
+	var nextParent attempttrace.AttemptID
+	var nextReason string
 	// include first call, max loop is retryTimes + 1
 	doCall := true
 	for callCount := 0; ; {
@@ -114,12 +123,22 @@ func (r *mixedRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpci
 			doCall = false
 			if callCount > 0 {
 				if ret, e := isExceedMaxDuration(ctx, startTime, maxDuration, atomic.LoadInt32(&callTimes)); ret {
+					col.AppendEvent(attempttrace.EventRetrySuppressed, 0, e.Error())
 					return firstRI, false, e
 				}
 			}
 			callCount++
+			var h *attempttrace.Handle
+			if callCount == 1 {
+				h = col.ReserveAttempt(attempttrace.TriggerInitial, 0, "initial attempt")
+			} else {
+				h = col.ReserveAttempt(nextTrigger, nextParent, nextReason)
+			}
+			inflightID = h.ID()
 			gofunc.GoFunc(ctx, func() {
 				if atomic.LoadInt32(&abort) == 1 {
+					// never ran a physical RPC: terminalize explicitly
+					h.AbortBeforeStart()
 					return
 				}
 				var (
@@ -130,9 +149,15 @@ func (r *mixedRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpci
 				defer func() {
 					if panicInfo := recover(); panicInfo != nil {
 						e = panicToErr(ctx, panicInfo, firstRI)
+						h.Finish(attempttrace.FinishInfo{
+							Status:    attempttrace.StatusPanicked,
+							ErrMsg:    fmt.Sprintf("panic in mixed retry: %v", panicInfo),
+							Abandoned: atomic.LoadInt32(&abort) == 1,
+						})
 					}
-					callDone <- resultWrapper{cRI, curResp, e}
+					callDone <- resultWrapper{cRI, curResp, e, h}
 				}()
+				h.MarkStarted()
 				ct := atomic.AddInt32(&callTimes, 1)
 				callStart := time.Now()
 				if r.cbContainer.enablePercentageLimit {
@@ -140,6 +165,7 @@ func (r *mixedRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpci
 					recordRetryStat(cbKey, r.cbContainer.cbPanel, ct)
 				}
 				cRI, e = rpcCall(ctx, r, req, curResp)
+				h.Finish(traceFinishInfo(cRI, e, atomic.LoadInt32(&abort) == 1, false))
 				recordCost(ct, callStart, &recordCostDoing, &callCosts, &abort, e)
 				if !r.cbContainer.enablePercentageLimit && r.cbContainer.cbStat {
 					circuitbreak.RecordStat(ctx, req, nil, e, cbKey, r.cbContainer.cbCtl, r.cbContainer.cbPanel)
@@ -150,8 +176,13 @@ func (r *mixedRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpci
 		case <-timer.C:
 			// backup retry
 			if _, ok := r.ShouldRetry(ctx, nil, callCount, req, cbKey); ok && callCount < retryTimes+1 {
+				nextTrigger = attempttrace.TriggerBackupRequest
+				nextParent = inflightID
+				nextReason = fmt.Sprintf("backup timer elapsed after %s", retryDelay)
 				doCall = true
 				timer.Reset(retryDelay)
+			} else {
+				col.AppendEvent(attempttrace.EventRetrySuppressed, inflightID, "backup retry not allowed or policy exhausted")
 			}
 		case res := <-callDone:
 			// result retry
@@ -162,12 +193,16 @@ func (r *mixedRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpci
 					if r.isRetryResult(ctx, res.ri, res.resp, res.err, &r.policy.FailurePolicy) {
 						// there is potential backoff logic in ShouldRetry
 						if msg, ok := r.ShouldRetry(ctx, nil, callCount, req, cbKey); ok {
+							nextTrigger = attempttrace.TriggerMixedFailure
+							nextParent = res.handle.ID()
+							nextReason = traceFailureReason(res.err)
 							doCall = true
 							timer.Reset(retryDelay)
 							continue
 						} else if msg != "" {
 							appendMsg := fmt.Sprintf("retried %d, %s", callCount-1, msg)
 							appendErrMsg(res.err, appendMsg)
+							col.AppendEvent(attempttrace.EventRetrySuppressed, res.handle.ID(), msg)
 						}
 					}
 				} else if r.isRetryResult(ctx, res.ri, res.resp, res.err, &r.policy.FailurePolicy) {
@@ -175,6 +210,9 @@ func (r *mixedRetryer) Do(ctx context.Context, rpcCall RPCCallFunc, firstRI rpci
 				}
 			}
 			atomic.StoreInt32(&abort, 1)
+			// winner adopted; other in-flight attempts remain non-terminal and
+			// are flagged abandoned until they really finish
+			col.MarkWinner(res.handle.ID())
 			recordRetryInfo(res.ri, atomic.LoadInt32(&callTimes), callCosts.String())
 			shallowCopyResults(res.resp, resp)
 			return res.ri, false, res.err

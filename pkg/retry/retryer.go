@@ -27,6 +27,7 @@ import (
 
 	"github.com/cloudwego/kitex/pkg/circuitbreak"
 	"github.com/cloudwego/kitex/pkg/klog"
+	"github.com/cloudwego/kitex/pkg/retry/attempttrace"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 )
 
@@ -343,6 +344,7 @@ func PrepareRetryContext(ctx context.Context) context.Context {
 // WithRetryIfNeeded to check if there is a retryer can be used and if current call can retry.
 // When the retry condition is satisfied, use retryer to call
 func (rc *Container) WithRetryIfNeeded(ctx context.Context, callOptRetry *Policy, rpcCall RPCCallFunc, ri rpcinfo.RPCInfo, request, response interface{}) (lastRI rpcinfo.RPCInfo, recycleRI bool, err error) {
+	col := traceCollector(ctx)
 	var retryer Retryer
 	if callOptRetry != nil && callOptRetry.Enable {
 		// build retryer for call level if retry policy is set up with callopt
@@ -353,9 +355,26 @@ func (rc *Container) WithRetryIfNeeded(ctx context.Context, callOptRetry *Policy
 		retryer = rc.getRetryer(ctx, ri)
 	}
 
+	if retryer != nil {
+		col.MarkLogicalStart(retryer.Type().String(), ri.To().Method())
+	} else {
+		col.MarkLogicalStart("None", ri.To().Method())
+	}
+	// The logical return does not imply every (backup) attempt has ended.
+	// Attempt-level terminalization happens on the real execution goroutines.
+	// A closure (rather than `defer col.MarkLogicalReturn(err)`) is required
+	// because deferred arguments are evaluated at defer time.
+	defer func() { col.MarkLogicalReturn(err) }()
+
 	// case 1(default, fast path): no retry policy
 	if retryer == nil {
-		if _, err = rpcCall(ctx, nil, request, response); err == nil {
+		h := col.ReserveAttempt(attempttrace.TriggerInitial, 0, "initial attempt")
+		h.MarkStarted()
+		var cRI rpcinfo.RPCInfo
+		cRI, err = rpcCall(ctx, nil, request, response)
+		h.Finish(traceFinishInfo(cRI, err, false, err == nil))
+		if err == nil {
+			col.MarkWinner(h.ID())
 			return ri, true, nil
 		}
 		return ri, false, err
@@ -363,11 +382,20 @@ func (rc *Container) WithRetryIfNeeded(ctx context.Context, callOptRetry *Policy
 
 	// case 2: setup retry policy, but not satisfy retry condition eg: circuit, retry times == 0, chain stop, ddl
 	if msg, ok := retryer.AllowRetry(ctx); !ok {
-		if _, err = rpcCall(ctx, retryer, request, response); err == nil {
+		h := col.ReserveAttempt(attempttrace.TriggerInitial, 0, "retry not allowed: "+msg)
+		h.MarkStarted()
+		var cRI rpcinfo.RPCInfo
+		cRI, err = rpcCall(ctx, retryer, request, response)
+		h.Finish(traceFinishInfo(cRI, err, false, err == nil))
+		if err == nil {
+			col.MarkWinner(h.ID())
 			return ri, true, err
 		}
 		if msg != "" {
 			retryer.AppendErrMsgIfNeeded(ctx, err, ri, msg)
+			col.AppendEvent(attempttrace.EventRetrySuppressed, 0, msg)
+		} else {
+			col.AppendEvent(attempttrace.EventRetrySuppressed, 0, "retry condition not satisfied")
 		}
 		return ri, false, err
 	}
